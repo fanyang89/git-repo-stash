@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     io::Write,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
 };
 
@@ -32,6 +33,9 @@ pub struct RepositoryState {
     has_heads: bool,
     has_tags: bool,
     all_refs: Vec<String>,
+    ref_values: BTreeMap<String, String>,
+    lfs_roots: Vec<String>,
+    has_non_commit_refs: bool,
 }
 
 #[derive(Debug)]
@@ -52,6 +56,10 @@ impl RepositoryState {
 pub fn inspect_repository(repository: &Repository) -> Result<RepositoryState> {
     let dirty = is_dirty(repository)?;
     let detached_unreferenced = has_unreferenced_detached_head(repository)?;
+    let ref_values = local_ref_values(repository, PushMode::Mirror)?;
+    let all_refs = ref_values.keys().cloned().collect::<Vec<_>>();
+    let (lfs_roots, has_non_commit_refs) =
+        lfs_roots(repository, ref_values.keys().map(String::as_str))?;
     let lfs_available = command_succeeds(clean_git().args(["lfs", "version"]));
     let has_lfs_objects = if lfs_available {
         has_lfs_objects(repository)?
@@ -60,7 +68,9 @@ pub fn inspect_repository(repository: &Repository) -> Result<RepositoryState> {
     } else {
         false
     };
-    let all_refs = ref_names(repository)?;
+    if local_ref_values(repository, PushMode::Mirror)? != ref_values {
+        bail!("repository refs changed while Git LFS objects were being inspected")
+    }
     Ok(RepositoryState {
         dirty,
         detached_unreferenced,
@@ -68,7 +78,104 @@ pub fn inspect_repository(repository: &Repository) -> Result<RepositoryState> {
         has_heads: all_refs.iter().any(|name| name.starts_with("refs/heads/")),
         has_tags: all_refs.iter().any(|name| name.starts_with("refs/tags/")),
         all_refs,
+        ref_values,
+        lfs_roots,
+        has_non_commit_refs,
     })
+}
+
+pub fn verify_safe_to_delete(repository: &Repository) -> Result<()> {
+    if repository.is_bare {
+        bail!("bare repositories are not deleted automatically")
+    }
+    if repository.path.join(".git").is_file() {
+        bail!("linked worktrees and submodule working trees are not deleted automatically")
+    }
+    verify_repository_identity(repository)?;
+    if has_unreferenced_detached_head(repository)? {
+        bail!("detached HEAD commit is unreachable from refs and was not backed up")
+    }
+    verify_single_worktree(repository)?;
+    verify_no_nested_repositories(repository)?;
+    verify_no_filesystem_boundaries(repository)?;
+
+    let status = git(repository)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ])
+        .output()
+        .context("failed to inspect files before deletion")?;
+    ensure_success(status.status, "inspect files before deletion")?;
+    if !status.stdout.is_empty() {
+        bail!("working tree contains modified, untracked, or ignored files")
+    }
+
+    let index = git(repository)
+        .args(["ls-files", "--stage"])
+        .output()
+        .context("failed to inspect submodules before deletion")?;
+    ensure_success(index.status, "inspect submodules before deletion")?;
+    if index
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"160000 "))
+    {
+        bail!("repository contains submodules that were not backed up independently")
+    }
+
+    let flags = git(repository)
+        .args(["ls-files", "-v"])
+        .output()
+        .context("failed to inspect index flags before deletion")?;
+    ensure_success(flags.status, "inspect index flags before deletion")?;
+    if flags.stdout.split(|byte| *byte == b'\n').any(|line| {
+        line.first()
+            .is_some_and(|flag| *flag == b'S' || flag.is_ascii_lowercase())
+    }) {
+        bail!("index contains assume-unchanged or skip-worktree entries")
+    }
+
+    let unreachable = git(repository)
+        .args(["fsck", "--unreachable", "--no-reflogs", "--no-progress"])
+        .output()
+        .context("failed to inspect unreachable Git objects before deletion")?;
+    ensure_success(
+        unreachable.status,
+        "inspect unreachable Git objects before deletion",
+    )?;
+    if !unreachable.stdout.is_empty() {
+        bail!("repository contains Git objects unreachable from refs")
+    }
+    Ok(())
+}
+
+pub fn verify_refs_unchanged(repository: &Repository, state: &RepositoryState) -> Result<()> {
+    if state.has_non_commit_refs {
+        bail!("repository has refs that do not point to commit history")
+    }
+    if local_ref_values(repository, PushMode::Mirror)? == state.ref_values {
+        Ok(())
+    } else {
+        bail!("repository refs changed while the backup was running")
+    }
+}
+
+pub fn verify_mirror_matches(
+    repository: &Repository,
+    remote_url: &str,
+    auth: Option<&HttpsAuth<'_>>,
+) -> Result<()> {
+    verify_remote_rewrite(repository, remote_url)?;
+    let local = local_ref_values(repository, PushMode::Mirror)?;
+    let remote = remote_ref_values(repository, remote_url, PushMode::Mirror, auth)?;
+    if local == remote {
+        Ok(())
+    } else {
+        bail!("remote refs do not exactly match the local mirror")
+    }
 }
 
 pub fn push_repository(
@@ -82,7 +189,7 @@ pub fn push_repository(
     verify_remote_rewrite(repository, remote_url)?;
     if state.has_lfs_objects {
         reject_lfs_redirects(repository)?;
-        push_lfs(repository, state, remote_url, mode, auth)?;
+        push_lfs(repository, state, remote_url, auth)?;
     }
 
     let mut command = network_git(repository, auth)?;
@@ -204,28 +311,23 @@ fn push_lfs(
     repository: &Repository,
     state: &RepositoryState,
     remote_url: &str,
-    mode: PushMode,
     auth: Option<&HttpsAuth<'_>>,
 ) -> Result<()> {
     let mut command = network_git(repository, auth)?;
-    command.args(["lfs", "push", "--all", remote_url]);
-    if mode == PushMode::Mirror {
-        command.arg("--stdin").stdin(Stdio::piped());
-        let mut child = command.spawn().context("failed to start git lfs push")?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("failed to open git lfs push input")?;
-        for reference in &state.all_refs {
-            writeln!(stdin, "{reference}").context("failed to send refs to git lfs push")?;
-        }
-        drop(stdin);
-        let status = child.wait().context("failed to wait for git lfs push")?;
-        ensure_success(status, "push Git LFS objects")
-    } else {
-        let status = command.status().context("failed to start git lfs push")?;
-        ensure_success(status, "push Git LFS objects")
+    command
+        .args(["lfs", "push", "--all", remote_url, "--stdin"])
+        .stdin(Stdio::piped());
+    let mut child = command.spawn().context("failed to start git lfs push")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to open git lfs push input")?;
+    for object_id in &state.lfs_roots {
+        writeln!(stdin, "{object_id}").context("failed to send refs to git lfs push")?;
     }
+    drop(stdin);
+    let status = child.wait().context("failed to wait for git lfs push")?;
+    ensure_success(status, "push Git LFS objects")
 }
 
 fn is_dirty(repository: &Repository) -> Result<bool> {
@@ -261,15 +363,6 @@ fn has_unreferenced_detached_head(repository: &Repository) -> Result<bool> {
     Ok(output.stdout.is_empty())
 }
 
-fn has_lfs_objects(repository: &Repository) -> Result<bool> {
-    let output = git(repository)
-        .args(["lfs", "ls-files", "--all"])
-        .output()
-        .context("failed to inspect Git LFS objects")?;
-    ensure_success(output.status, "inspect Git LFS objects")?;
-    Ok(!output.stdout.is_empty())
-}
-
 fn might_use_lfs(repository: &Repository) -> Result<bool> {
     let output = git(repository)
         .args([
@@ -287,14 +380,179 @@ fn might_use_lfs(repository: &Repository) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-fn ref_names(repository: &Repository) -> Result<Vec<String>> {
+fn has_lfs_objects(repository: &Repository) -> Result<bool> {
     let output = git(repository)
-        .args(["for-each-ref", "--format=%(refname)"])
+        .args(["lfs", "ls-files", "--all"])
         .output()
-        .context("failed to enumerate Git refs")?;
-    ensure_success(output.status, "enumerate Git refs")?;
-    let refs = String::from_utf8(output.stdout).context("Git returned non-UTF-8 refs")?;
-    Ok(refs.lines().map(str::to_owned).collect())
+        .context("failed to inspect Git LFS objects")?;
+    ensure_success(output.status, "inspect Git LFS objects")?;
+    Ok(!output.stdout.is_empty())
+}
+
+fn lfs_roots<'a>(
+    repository: &Repository,
+    references: impl Iterator<Item = &'a str>,
+) -> Result<(Vec<String>, bool)> {
+    let mut roots = std::collections::BTreeSet::new();
+    let mut has_non_commit_refs = false;
+    for reference in references {
+        let output = git(repository)
+            .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
+            .output()
+            .context("failed to resolve Git LFS root")?;
+        if output.status.success() {
+            roots.insert(
+                String::from_utf8(output.stdout)
+                    .context("Git returned a non-UTF-8 object ID")?
+                    .trim()
+                    .to_owned(),
+            );
+        } else {
+            has_non_commit_refs = true;
+        }
+    }
+    Ok((roots.into_iter().collect(), has_non_commit_refs))
+}
+
+fn verify_single_worktree(repository: &Repository) -> Result<()> {
+    let output = git(repository)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("failed to inspect linked worktrees before deletion")?;
+    ensure_success(output.status, "inspect linked worktrees before deletion")?;
+    let worktree_count = String::from_utf8(output.stdout)
+        .context("Git returned non-UTF-8 worktree paths")?
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count();
+    if worktree_count == 1 {
+        Ok(())
+    } else {
+        bail!("repository has linked worktrees")
+    }
+}
+
+fn verify_no_nested_repositories(repository: &Repository) -> Result<()> {
+    let modules = repository.path.join(".git/modules");
+    if modules.is_dir()
+        && modules
+            .read_dir()
+            .context("failed to inspect Git submodule metadata")?
+            .next()
+            .is_some()
+    {
+        bail!("repository contains retained submodule metadata")
+    }
+
+    let mut entries = walkdir::WalkDir::new(&repository.path)
+        .follow_links(false)
+        .into_iter();
+    while let Some(entry) = entries.next() {
+        let entry = entry.context("failed to inspect nested repositories before deletion")?;
+        let is_git_metadata = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"));
+        if entry.depth() == 1 && is_git_metadata {
+            entries.skip_current_dir();
+            continue;
+        }
+        if entry.depth() > 1 && is_git_metadata {
+            bail!(
+                "repository contains nested Git metadata at {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_repository_identity(repository: &Repository) -> Result<()> {
+    let output = git(repository)
+        .args(["rev-parse", "--show-toplevel", "--absolute-git-dir"])
+        .output()
+        .context("failed to verify repository paths before deletion")?;
+    ensure_success(output.status, "verify repository paths before deletion")?;
+    let paths = String::from_utf8(output.stdout).context("Git returned non-UTF-8 paths")?;
+    let mut paths = paths.lines();
+    let top_level = paths.next().context("Git did not return a worktree path")?;
+    let git_dir = paths.next().context("Git did not return a Git directory")?;
+    let expected_top_level = repository
+        .path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve worktree {}", repository.path.display()))?;
+    let expected_git_dir = repository
+        .path
+        .join(".git")
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "failed to resolve Git directory in {}",
+                repository.path.display()
+            )
+        })?;
+    if Path::new(top_level).canonicalize()? == expected_top_level
+        && Path::new(git_dir).canonicalize()? == expected_git_dir
+    {
+        Ok(())
+    } else {
+        bail!("Git configuration redirects the repository outside its candidate directory")
+    }
+}
+
+#[cfg(unix)]
+fn verify_no_filesystem_boundaries(repository: &Repository) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_device = repository.path.metadata()?.dev();
+    for entry in walkdir::WalkDir::new(&repository.path).follow_links(false) {
+        let entry = entry.context("failed to inspect filesystem boundaries before deletion")?;
+        if entry.file_type().is_dir() && entry.metadata()?.dev() != root_device {
+            bail!(
+                "repository crosses a filesystem boundary at {}",
+                entry.path().display()
+            )
+        }
+    }
+    verify_linux_mount_points(repository)
+}
+
+#[cfg(not(unix))]
+fn verify_no_filesystem_boundaries(_repository: &Repository) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_mount_points(repository: &Repository) -> Result<()> {
+    let root = repository.path.canonicalize()?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .context("failed to inspect Linux mount points before deletion")?;
+    for line in mountinfo.lines() {
+        let Some(encoded_path) = line.split_whitespace().nth(4) else {
+            continue;
+        };
+        let mount_path = PathBuf::from(decode_mount_path(encoded_path));
+        if mount_path == root || mount_path.starts_with(&root) {
+            bail!(
+                "repository contains a mount point at {}",
+                mount_path.display()
+            )
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_linux_mount_points(_repository: &Repository) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mount_path(path: &str) -> String {
+    path.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 fn verify_remote_rewrite(repository: &Repository, remote_url: &str) -> Result<()> {
@@ -337,7 +595,6 @@ fn reject_lfs_redirects(repository: &Repository) -> Result<()> {
     let output = git(repository)
         .args([
             "config",
-            "--local",
             "--get-regexp",
             r"^(lfs\.(url|pushurl)|remote\..*\.lfsurl)$",
         ])
@@ -423,11 +680,31 @@ fn git(repository: &Repository) -> Command {
 
 fn clean_git() -> Command {
     let mut command = Command::new("git");
-    command
-        .env_remove("GITEA_TOKEN")
-        .env_remove(ASKPASS_MODE_ENV)
-        .env_remove(ASKPASS_TOKEN_ENV)
-        .env_remove(ASKPASS_USERNAME_ENV);
+    for name in [
+        "GITEA_TOKEN",
+        ASKPASS_MODE_ENV,
+        ASKPASS_TOKEN_ENV,
+        ASKPASS_USERNAME_ENV,
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_CONFIG_") {
+            command.env_remove(name);
+        }
+    }
     command
 }
 
@@ -665,6 +942,116 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("divergent refs"));
+    }
+
+    #[test]
+    fn ignored_files_prevent_local_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repository, _) = repositories(directory.path());
+        fs::write(repository.path.join(".gitignore"), "generated.log\n").unwrap();
+        commit(&repository.path, "ignore generated file");
+        fs::write(repository.path.join("generated.log"), "not backed up\n").unwrap();
+
+        let error = verify_safe_to_delete(&repository).unwrap_err();
+
+        assert!(error.to_string().contains("ignored files"));
+        assert!(repository.path.join("generated.log").exists());
+    }
+
+    #[test]
+    fn modified_files_prevent_local_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repository, _) = repositories(directory.path());
+        fs::write(repository.path.join("README.md"), "modified\n").unwrap();
+
+        let error = verify_safe_to_delete(&repository).unwrap_err();
+
+        assert!(error.to_string().contains("modified"));
+        assert!(repository.path.exists());
+    }
+
+    #[test]
+    fn hidden_index_changes_prevent_local_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repository, _) = repositories(directory.path());
+        run(Command::new("git")
+            .args(["-C"])
+            .arg(&repository.path)
+            .args(["update-index", "--assume-unchanged", "README.md"]));
+        fs::write(repository.path.join("README.md"), "hidden change\n").unwrap();
+
+        let error = verify_safe_to_delete(&repository).unwrap_err();
+
+        assert!(error.to_string().contains("assume-unchanged"));
+    }
+
+    #[test]
+    fn linked_worktrees_prevent_local_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repository, _) = repositories(directory.path());
+        let linked = directory.path().join("linked");
+        run(Command::new("git")
+            .args(["-C"])
+            .arg(&repository.path)
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&linked));
+
+        let error = verify_safe_to_delete(&repository).unwrap_err();
+
+        assert!(error.to_string().contains("linked worktrees"));
+    }
+
+    #[test]
+    fn unreachable_objects_prevent_local_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repository, _) = repositories(directory.path());
+        fs::write(repository.path.join("temporary.txt"), "temporary\n").unwrap();
+        commit(&repository.path, "temporary commit");
+        run(Command::new("git")
+            .args(["-C"])
+            .arg(&repository.path)
+            .args(["reset", "--hard", "--quiet", "HEAD~1"]));
+
+        let error = verify_safe_to_delete(&repository).unwrap_err();
+
+        assert!(error.to_string().contains("unreachable from refs"));
+    }
+
+    #[test]
+    fn ref_changes_are_detected_before_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repository, _) = repositories(directory.path());
+        let state = inspect_repository(&repository).unwrap();
+        run(Command::new("git")
+            .args(["-C"])
+            .arg(&repository.path)
+            .args(["tag", "added-during-backup"]));
+
+        let error = verify_refs_unchanged(&repository, &state).unwrap_err();
+
+        assert!(error.to_string().contains("refs changed"));
+    }
+
+    #[test]
+    fn non_commit_refs_prevent_local_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repository, _) = repositories(directory.path());
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(&repository.path)
+            .args(["hash-object", "-w", "README.md"])
+            .output()
+            .unwrap();
+        let object_id = String::from_utf8(output.stdout).unwrap();
+        run(Command::new("git")
+            .args(["-C"])
+            .arg(&repository.path)
+            .args(["update-ref", "refs/data/blob", object_id.trim()]));
+        let state = inspect_repository(&repository).unwrap();
+
+        let error = verify_refs_unchanged(&repository, &state).unwrap_err();
+
+        assert!(error.to_string().contains("do not point to commit"));
     }
 
     fn repositories(root: &std::path::Path) -> (Repository, std::path::PathBuf) {

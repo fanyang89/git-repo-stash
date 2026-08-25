@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    env,
     ffi::OsStr,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -135,7 +136,7 @@ pub fn assign_names(
 }
 
 fn inspect_repository(workdir: &Path, candidate: &Path) -> Result<(Repository, PathBuf)> {
-    let output = Command::new("git")
+    let output = clean_git()
         .args(["-C"])
         .arg(candidate)
         .args([
@@ -196,6 +197,32 @@ fn inspect_repository(workdir: &Path, candidate: &Path) -> Result<(Repository, P
         },
         common_directory,
     ))
+}
+
+fn clean_git() -> Command {
+    let mut command = Command::new("git");
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_CONFIG_") {
+            command.env_remove(name);
+        }
+    }
+    command
 }
 
 fn resolve_generated_collisions(

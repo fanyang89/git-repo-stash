@@ -11,31 +11,9 @@ use std::{
 #[test]
 fn creates_resources_records_mapping_and_pushes_repository() {
     let directory = tempfile::tempdir().unwrap();
-    let workdir = directory.path().join("workdir");
-    let source = workdir.join("source");
-    let remote = directory.path().join("remote.git");
-    fs::create_dir_all(&source).unwrap();
-    run(Command::new("git").args(["init", "--quiet"]).arg(&source));
-    run(Command::new("git")
-        .args(["init", "--quiet", "--bare"])
-        .arg(&remote));
-    fs::write(source.join("README.md"), "backup test\n").unwrap();
-    run(Command::new("git")
-        .args(["-C"])
-        .arg(&source)
-        .args(["add", "README.md"]));
-    run(Command::new("git").args(["-C"]).arg(&source).args([
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.com",
-        "commit",
-        "--quiet",
-        "-m",
-        "initial",
-    ]));
+    let (workdir, _source, remote) = create_repositories(directory.path());
 
-    let (server_url, server) = start_gitea_server(&remote);
+    let (server_url, server) = start_gitea_server(&remote, 5);
     let output = Command::new(env!("CARGO_BIN_EXE_git-repo-stash"))
         .arg(&workdir)
         .args([
@@ -72,7 +50,114 @@ fn creates_resources_records_mapping_and_pushes_repository() {
     );
 }
 
-fn start_gitea_server(remote: &Path) -> (String, thread::JoinHandle<()>) {
+#[test]
+fn deletes_a_clean_repository_after_a_successful_mirror_backup() {
+    let directory = tempfile::tempdir().unwrap();
+    let (workdir, source, remote) = create_repositories(directory.path());
+    let (server_url, server) = start_gitea_server(&remote, 5);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-repo-stash"))
+        .arg(&workdir)
+        .args([
+            "--gitea-url",
+            &server_url,
+            "--org",
+            "backup",
+            "--allow-insecure-http",
+            "--mirror",
+            "--delete-after-backup",
+        ])
+        .env("GITEA_TOKEN", "secret")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    assert!(!source.exists());
+    let mapping = fs::read_to_string(workdir.join(".git-repo-stash.toml")).unwrap();
+    assert!(!mapping.contains("source = \"source\""));
+    let refs = Command::new("git")
+        .args(["--git-dir"])
+        .arg(&remote)
+        .args(["for-each-ref", "--format=%(refname)"])
+        .output()
+        .unwrap();
+    assert!(!refs.stdout.is_empty());
+}
+
+#[test]
+fn dry_run_previews_deletion_without_removing_the_repository() {
+    let directory = tempfile::tempdir().unwrap();
+    let (workdir, source, remote) = create_repositories(directory.path());
+    let (server_url, server) = start_gitea_server(&remote, 2);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-repo-stash"))
+        .arg(&workdir)
+        .args([
+            "--gitea-url",
+            &server_url,
+            "--org",
+            "backup",
+            "--allow-insecure-http",
+            "--mirror",
+            "--delete-after-backup",
+            "--dry-run",
+        ])
+        .env("GITEA_TOKEN", "secret")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    assert!(source.exists());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Would delete")
+    );
+    assert!(!workdir.join(".git-repo-stash.toml").exists());
+}
+
+fn create_repositories(
+    root: &Path,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let workdir = root.join("workdir");
+    let source = workdir.join("source");
+    let remote = root.join("remote.git");
+    fs::create_dir_all(&source).unwrap();
+    run(Command::new("git").args(["init", "--quiet"]).arg(&source));
+    run(Command::new("git")
+        .args(["init", "--quiet", "--bare"])
+        .arg(&remote));
+    fs::write(source.join("README.md"), "backup test\n").unwrap();
+    run(Command::new("git")
+        .args(["-C"])
+        .arg(&source)
+        .args(["add", "README.md"]));
+    run(Command::new("git").args(["-C"]).arg(&source).args([
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "initial",
+    ]));
+    (workdir, source, remote)
+}
+
+fn start_gitea_server(remote: &Path, expected_requests: usize) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -80,7 +165,7 @@ fn start_gitea_server(remote: &Path) -> (String, thread::JoinHandle<()>) {
     let handle = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut handled = 0;
-        while handled < 5 && Instant::now() < deadline {
+        while handled < expected_requests && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let request = read_request(&mut stream);
@@ -119,7 +204,7 @@ fn start_gitea_server(remote: &Path) -> (String, thread::JoinHandle<()>) {
                 Err(error) => panic!("test server failed: {error}"),
             }
         }
-        assert_eq!(handled, 5, "test server timed out");
+        assert_eq!(handled, expected_requests, "test server timed out");
     });
     (format!("http://{address}"), handle)
 }

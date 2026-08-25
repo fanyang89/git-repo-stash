@@ -4,7 +4,13 @@ mod git;
 mod gitea;
 mod mapping;
 
-use std::{env, ffi::OsString, path::Path, process::ExitCode};
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -16,7 +22,8 @@ use crate::{
     discovery::{NamedRepository, assign_names, discover, generated_name},
     git::{
         ASKPASS_MODE_ENV, ASKPASS_TOKEN_ENV, ASKPASS_USERNAME_ENV, HttpsAuth, PushMode,
-        inspect_repository, push_repository, verify_adoption,
+        RepositoryState, inspect_repository, push_repository, verify_adoption,
+        verify_mirror_matches, verify_refs_unchanged, verify_safe_to_delete,
     },
     gitea::{GiteaClient, Lookup, RemoteRepository},
     mapping::Mapping,
@@ -144,6 +151,10 @@ fn back_up_repository(
         PushMode::BranchesAndTags
     };
     let state = inspect_repository(local)?;
+    if cli.delete_after_backup {
+        verify_deletion_candidate(workdir, local)?;
+        verify_refs_unchanged(local, &state)?;
+    }
     if state.dirty {
         eprintln!(
             "Warning: {} has uncommitted or untracked files",
@@ -216,6 +227,9 @@ fn back_up_repository(
             select_remote(remote, cli.protocol, cli.allow_insecure_http)?;
         }
         println!("Would push {} -> {qualified_name}", local.relative_path);
+        if cli.delete_after_backup {
+            println!("Would delete {}", local.path.display());
+        }
         return Ok(());
     }
     let remote = remote.ok_or_else(|| anyhow!("repository URL is unavailable"))?;
@@ -237,7 +251,114 @@ fn back_up_repository(
         record_mapping(workdir, mapping, named)?;
         println!("Adopted repository {qualified_name}");
     }
+    if cli.delete_after_backup {
+        delete_local_repository(workdir, mapping, named, &state, remote_url, auth.as_ref())?;
+    }
     Ok(())
+}
+
+fn verify_deletion_candidate(workdir: &Path, local: &discovery::Repository) -> Result<()> {
+    if local.path == workdir {
+        bail!("refusing to delete a repository that is also the workdir")
+    }
+    verify_safe_to_delete(local)
+        .with_context(|| format!("{} is not safe to delete", local.relative_path))
+}
+
+fn delete_local_repository(
+    workdir: &Path,
+    mapping: &mut Mapping,
+    named: &NamedRepository,
+    state: &RepositoryState,
+    remote_url: &str,
+    auth: Option<&HttpsAuth<'_>>,
+) -> Result<()> {
+    let original_path = &named.repository.path;
+    verify_deletion_candidate(workdir, &named.repository)?;
+    verify_refs_unchanged(&named.repository, state)?;
+    verify_mirror_matches(&named.repository, remote_url, auth)?;
+
+    let quarantine_path = quarantine_path(&named.repository)?;
+    fs::rename(original_path, &quarantine_path).with_context(|| {
+        format!(
+            "failed to isolate {} before deletion",
+            original_path.display()
+        )
+    })?;
+    let mut quarantined = named.repository.clone();
+    quarantined.path = quarantine_path.clone();
+    let quarantine_check = verify_safe_to_delete(&quarantined)
+        .and_then(|()| verify_refs_unchanged(&quarantined, state))
+        .and_then(|()| verify_mirror_matches(&quarantined, remote_url, auth));
+    if let Err(error) = quarantine_check {
+        restore_quarantined_repository(original_path, &quarantine_path)?;
+        return Err(error).context("repository changed while it was being isolated for deletion");
+    }
+
+    let relative_path = &named.repository.relative_path;
+    let Some(remote_name) = mapping.repositories.remove(relative_path) else {
+        restore_quarantined_repository(original_path, &quarantine_path)?;
+        bail!("repository mapping disappeared before local deletion")
+    };
+    if let Err(error) = mapping.save(workdir) {
+        mapping
+            .repositories
+            .insert(relative_path.clone(), remote_name);
+        restore_quarantined_repository(original_path, &quarantine_path)?;
+        return Err(error).context("failed to remove mapping before local deletion");
+    }
+
+    if let Err(delete_error) = fs::remove_dir_all(&quarantine_path) {
+        mapping
+            .repositories
+            .insert(relative_path.clone(), remote_name);
+        let mapping_restore = mapping.save(workdir);
+        let path_restore = restore_quarantined_repository(original_path, &quarantine_path);
+        mapping_restore.with_context(|| {
+            format!("failed to restore mapping after local deletion failed: {delete_error}")
+        })?;
+        path_restore?;
+        return Err(delete_error)
+            .with_context(|| format!("failed to delete {}", original_path.display()));
+    }
+    println!("Deleted {}", original_path.display());
+    Ok(())
+}
+
+fn quarantine_path(repository: &discovery::Repository) -> Result<PathBuf> {
+    let parent = repository
+        .path
+        .parent()
+        .ok_or_else(|| anyhow!("repository has no parent directory"))?;
+    for attempt in 0..1000 {
+        let candidate = parent.join(format!(
+            ".git-repo-stash-deleting-{}-{}-{attempt}",
+            repository.base_name,
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not allocate a quarantine path for deletion")
+}
+
+fn restore_quarantined_repository(original: &Path, quarantine: &Path) -> Result<()> {
+    if !quarantine.exists() {
+        return Ok(());
+    }
+    if original.exists() {
+        bail!(
+            "repository was retained at {} because its original path is occupied",
+            quarantine.display()
+        )
+    }
+    fs::rename(quarantine, original).with_context(|| {
+        format!(
+            "repository was retained at {}, but restoring its original path failed",
+            quarantine.display()
+        )
+    })
 }
 
 fn verify_object_format(local: &discovery::Repository, remote: &RemoteRepository) -> Result<()> {

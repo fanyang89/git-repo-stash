@@ -1,11 +1,13 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 const MAPPING_FILE: &str = ".git-repo-stash.toml";
 
@@ -44,17 +46,27 @@ impl Mapping {
 
     pub fn save(&self, workdir: &Path) -> Result<()> {
         let destination = path(workdir);
-        let temporary = workdir.join(format!("{MAPPING_FILE}.tmp"));
         let contents =
             toml::to_string_pretty(self).context("failed to serialize repository mapping")?;
-        fs::write(&temporary, contents)
-            .with_context(|| format!("failed to write {}", temporary.display()))?;
-        fs::rename(&temporary, &destination).with_context(|| {
-            format!(
-                "failed to replace repository mapping {}",
-                destination.display()
-            )
+        let mut temporary = NamedTempFile::new_in(workdir).with_context(|| {
+            format!("failed to create a temporary file in {}", workdir.display())
         })?;
+        temporary
+            .write_all(contents.as_bytes())
+            .context("failed to write repository mapping")?;
+        temporary
+            .as_file()
+            .sync_all()
+            .context("failed to sync repository mapping")?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!(
+                    "failed to replace repository mapping {}",
+                    destination.display()
+                )
+            })?;
         Ok(())
     }
 }
@@ -92,5 +104,27 @@ mod tests {
         let loaded = Mapping::load(directory.path()).unwrap();
 
         assert_eq!(loaded.repositories, mapping.repositories);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapping_save_replaces_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::write(&target, "do not overwrite\n").unwrap();
+        symlink(&target, directory.path().join(MAPPING_FILE)).unwrap();
+        let mapping = Mapping::default();
+
+        mapping.save(directory.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(target).unwrap(), "do not overwrite\n");
+        assert!(
+            !fs::symlink_metadata(directory.path().join(MAPPING_FILE))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

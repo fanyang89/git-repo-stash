@@ -39,6 +39,10 @@ pub struct Cli {
     /// Allow tokens to be sent over unencrypted HTTP
     #[arg(long)]
     pub allow_insecure_http: bool,
+
+    /// Delete clean local repositories after a successful mirror backup
+    #[arg(long, requires = "mirror")]
+    pub delete_after_backup: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -47,4 +51,23 @@ pub enum Protocol {
     Auto,
     Ssh,
     Https,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_requires_mirror_mode() {
+        let error = Cli::try_parse_from([
+            "git-repo-stash",
+            "workdir",
+            "--gitea-url",
+            "https://example.com",
+            "--delete-after-backup",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--mirror"));
+    }
 }

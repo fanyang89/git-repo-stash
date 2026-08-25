@@ -53,6 +53,7 @@ Important options:
 --dry-run                  Query Gitea without creating or pushing
 --adopt-existing           Associate an existing untracked remote repository
 --allow-insecure-http      Allow tokens over unencrypted HTTP
+--delete-after-backup      Delete clean repositories after mirror backup
 ```
 
 The Gitea URL must be the instance root, including any installation subpath,
@@ -106,6 +107,18 @@ treated as separate backups.
 
 The command does not add or modify local Git remotes. A failed repository does
 not stop later repositories; any failure produces a non-zero exit status.
+
+`--delete-after-backup` requires `--mirror`. After a successful Git and LFS
+push, it permanently deletes the local repository directory and removes its
+path mapping. Deletion is refused for the workdir itself, dirty repositories,
+ignored or untracked files, bare repositories, submodules, nested repositories,
+linked worktrees, mount points, hidden index flags, non-commit refs, unreachable
+Git objects, and detached commits that are unreachable from refs. Local and
+remote refs must still match the pre-push snapshot. The directory is isolated
+with an atomic rename and checked again before deletion. Local Git config,
+hooks, reflog metadata, ACLs, and extended attributes are not backed up. Do not
+run concurrent writers during deletion. Use
+`--dry-run --mirror --delete-after-backup` to preview the operation.
 
 ## Authentication
 
