@@ -128,6 +128,37 @@ fn dry_run_previews_deletion_without_removing_the_repository() {
     assert!(!workdir.join(".git-repo-stash.toml").exists());
 }
 
+#[test]
+fn reports_repository_failures_in_the_final_summary() {
+    let directory = tempfile::tempdir().unwrap();
+    let (workdir, source, remote) = create_repositories(directory.path());
+    fs::write(source.join("README.md"), "uncommitted change\n").unwrap();
+    let (server_url, server) = start_gitea_server(&remote, 3);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-repo-stash"))
+        .arg(&workdir)
+        .args([
+            "--gitea-url",
+            &server_url,
+            "--org",
+            "backup",
+            "--allow-insecure-http",
+            "--mirror",
+            "--delete-after-backup",
+        ])
+        .env("GITEA_TOKEN", "secret")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    server.join().unwrap();
+    assert!(source.exists());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Backup summary: 0/1 repositories succeeded; 1 failure(s)"));
+    assert!(stderr.contains("Failures:\n  - source: source is not safe to delete"));
+    assert!(stderr.contains("working tree contains modified, untracked, or ignored files"));
+}
+
 fn create_repositories(
     root: &Path,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {

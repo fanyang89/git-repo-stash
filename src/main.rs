@@ -34,7 +34,8 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(error) => {
             eprintln!("Error: {error:#}");
             ExitCode::FAILURE
@@ -64,7 +65,7 @@ fn print_env(name: &str) {
     println!("{}", value.to_string_lossy());
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<bool> {
     let workdir = cli
         .workdir
         .canonicalize()
@@ -87,7 +88,11 @@ fn run(cli: Cli) -> Result<()> {
         .context("failed to authenticate with Gitea")?;
 
     let discovered = discover(&workdir);
-    let mut failures = discovered.errors.len();
+    let mut failures = discovered
+        .errors
+        .iter()
+        .map(|error| format!("scan: {error}"))
+        .collect::<Vec<_>>();
     for error in &discovered.errors {
         eprintln!("Scan error: {error}");
     }
@@ -95,6 +100,8 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut mapping = Mapping::load(&workdir)?;
     let repositories = assign_names(discovered.repositories, &mapping.repositories)?;
+    let repository_count = repositories.len();
+    let mut succeeded = 0;
     let org_exists = match gitea.organization(&org)? {
         Lookup::Found(()) => true,
         Lookup::Missing if cli.dry_run => {
@@ -120,15 +127,30 @@ fn run(cli: Cli) -> Result<()> {
             &mut mapping,
             &repository,
         ) {
-            failures += 1;
             eprintln!("Failed {}: {error:#}", repository.repository.relative_path);
+            failures.push(format!(
+                "{}: {error:#}",
+                repository.repository.relative_path
+            ));
+        } else {
+            succeeded += 1;
         }
     }
 
-    if failures > 0 {
-        bail!("{failures} operation(s) failed");
+    if failures.is_empty() {
+        println!("Backup summary: {succeeded}/{repository_count} repositories succeeded");
+        return Ok(true);
     }
-    Ok(())
+
+    eprintln!(
+        "\nBackup summary: {succeeded}/{repository_count} repositories succeeded; {} failure(s)",
+        failures.len()
+    );
+    eprintln!("Failures:");
+    for failure in &failures {
+        eprintln!("  - {failure}");
+    }
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
