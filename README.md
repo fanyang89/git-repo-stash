@@ -16,6 +16,18 @@ repositories in a Gitea organization, and pushes committed Git data as a backup.
 cargo install --path .
 ```
 
+For a static x86_64 Linux binary, install Zig and `cargo-zigbuild`, add the
+musl target, then use the project shortcut:
+
+```sh
+cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-musl
+cargo musl
+```
+
+The binary is written to
+`target/x86_64-unknown-linux-musl/release/git-repo-stash`.
+
 ## Usage
 
 ```sh
